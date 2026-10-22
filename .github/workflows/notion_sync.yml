@@ -20,7 +20,7 @@ jobs:
 
       - name: 필요 패키지 설치
         run: |
-          pip install requests feedparser beautifulsoup4 notion-client python-dateutil
+          pip install requests feedparser beautifulsoup4 notion-client python-dateutil pypdf
 
       - name: 노션 스크립트 실행
         env:
