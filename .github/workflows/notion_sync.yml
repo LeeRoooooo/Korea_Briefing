@@ -1,0 +1,30 @@
+name: Sync Briefing to Notion
+
+on:
+  schedule:
+    # 한국 시간 기준 매일 아침 06:00 (UTC 21:00)
+    - cron: '0 21 * * *'
+  workflow_dispatch: # Actions 탭에서 수동 실행 버튼 제공
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 필요 패키지 설치
+        run: |
+          pip install requests feedparser beautifulsoup4 notion-client
+
+      - name: 노션 스크립트 실행
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PARENT_PAGE_ID: ${{ secrets.NOTION_PARENT_PAGE_ID }}
+        run: |
+          python notion_collector.py
