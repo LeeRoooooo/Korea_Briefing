@@ -61,7 +61,7 @@ def clean_html_to_text(element):
     if not element:
         return ""
 
-    # 불필요한 요소 제거
+    # 불필요한 태그 완전 제거
     for tag in element.find_all(class_=["remark_briefing", "law_copy_wrap", "filedown", "kogl", "btn"]):
         tag.decompose()
     for tag in element.find_all(["script", "style", "noscript"]):
@@ -75,7 +75,7 @@ def clean_html_to_text(element):
 
     raw_text = html.unescape(element.get_text())
 
-    # 공백 정리
+    # 공백 정리 및 잔여 전재 문구 필터링
     cleaned_lines = []
     for line in raw_text.splitlines():
         line_str = re.sub(r"[ \t]+", " ", line).strip()
@@ -86,19 +86,16 @@ def clean_html_to_text(element):
 
     return "\n\n".join(cleaned_lines)
 
-def fetch_content_with_browser(page, url, target_dept, fallback_desc=""):
+def fetch_content_with_mobile_browser(page, url, target_dept, fallback_desc=""):
     """
-    Playwright 브라우저 탭을 통해 원문 페이지를 열어 본문(view_cont) 추출
+    모바일 에뮬레이션 상태에서 페이지 접근 후 본문 추출
     """
     try:
-        # domcontentloaded 상태까지만 대기하여 속도 최적화
-        page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        # commit 상태(HTML 응답 수신 직후)까지만 대기하여 타임아웃 방지
+        page.goto(url, wait_until="commit", timeout=15000)
         
-        # view_cont 요소 대기 (최대 4초)
-        try:
-            page.wait_for_selector(".view_cont, .article_body", timeout=4000)
-        except Exception:
-            pass
+        # 모바일 DOM 렌더링을 위해 1초 대기
+        page.wait_for_timeout(1000)
 
         html_content = page.content()
         soup = BeautifulSoup(html_content, "html.parser")
@@ -126,9 +123,9 @@ def fetch_content_with_browser(page, url, target_dept, fallback_desc=""):
                 return text_content
 
     except Exception as e:
-        print(f"      [!] 브라우저 본문 로딩 실패 ({e}) -> 피드 백업 전환")
+        print(f"      [!] 모바일 브라우저 로딩 예외: {e}")
 
-    # 예외 발생 시 피드 요약본 폴백
+    # 브라우저 차단/실패 시 feed.xml 요약본 폴백
     if fallback_desc and len(fallback_desc.strip()) > 10:
         desc_soup = BeautifulSoup(fallback_desc, "html.parser")
         desc_text = desc_soup.get_text(separator="\n\n").strip()
@@ -194,24 +191,25 @@ def main():
     parent_page_id = parent_page["id"]
     print(f"[+] 노션 상위 항목 생성 완료: {parent_title}")
 
-    # Playwright 브라우저 세션 기동
-    print("[*] Playwright 브라우저 기동 중...")
+    # Playwright 모바일 에뮬레이션 브라우저 기동
+    print("[*] Playwright 모바일 에뮬레이터(iPhone 14) 기동 중...")
     with sync_playwright() as p:
+        # iPhone 14 하드웨어/브라우저 규격 적용
+        device_profile = p.devices["iPhone 14"]
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            locale="ko-KR"
+            **device_profile,
+            locale="ko-KR",
+            timezone_id="Asia/Seoul"
         )
-        # 이미지, 폰트, 미디어 차단으로 로딩 속도 5배 향상
         page = context.new_page()
-        page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
 
         for idx, item in enumerate(target_entries, start=1):
             child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
-            print(f"  -> [{idx}/{len(target_entries)}] 본문 수집 중: [{item['dept']}] {item['title'][:20]}...")
+            print(f"  -> [{idx}/{len(target_entries)}] 모바일 본문 수집 중: [{item['dept']}] {item['title'][:20]}...")
             
-            # 브라우저로 실제 본문 파싱
-            body_text = fetch_content_with_browser(
+            # 모바일 페이지 본문 추출
+            body_text = fetch_content_with_mobile_browser(
                 page=page,
                 url=item["link"],
                 target_dept=item["dept"],
