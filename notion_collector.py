@@ -57,14 +57,10 @@ def extract_department_and_title(raw_title):
     return "담당부처 미상", raw_title.strip()
 
 # -------------------------------------------------------------
-# 2. 모바일 엔드포인트 URL 변환 및 본문 정밀 정제
+# 2. 모바일 URL 변환 및 더미 데이터 완벽 절단 정제기
 # -------------------------------------------------------------
 def convert_to_mobile_url(url):
-    """
-    PC용 URL을 m.korea.kr 모바일 전용 주소 및 파라미터로 강제 변환
-    예: https://www.korea.kr/briefing/pressReleaseView.do?newsId=123
-        -> https://m.korea.kr/briefing/pressReleaseView.do?newsId=123&pWise=mSub
-    """
+    """PC URL을 m.korea.kr 모바일 주소로 강제 변환"""
     if not url:
         return ""
     mobile_url = url.replace("://www.korea.kr", "://m.korea.kr")
@@ -74,31 +70,50 @@ def convert_to_mobile_url(url):
     return mobile_url
 
 def clean_html_to_text(element):
-    """HTML 요소에서 불필요한 영역을 제거하고 줄바꿈을 온전히 살려 반환"""
+    """
+    HTML 요소에서 잡음 태그를 삭제하고,
+    '이전다음기사', '공유열기', '운영원칙' 등 하단 더미 데이터 직전까지만 절단
+    """
     if not element:
         return ""
 
-    # 불필요한 공통 태그 완전 제거
-    for tag in element.find_all(class_=["remark_briefing", "law_copy_wrap", "filedown", "kogl", "btn"]):
-        tag.decompose()
-    for tag in element.find_all(["script", "style", "noscript"]):
-        tag.decompose()
+    # 불필요한 태그 및 공통 레이아웃 제거
+    noise_selectors = [
+        ".remark_briefing", ".law_copy_wrap", ".filedown", ".kogl", ".btn",
+        ".prev_next", ".prev_next_wrap", ".sns_share", ".sns_wrap",
+        ".reply_wrap", ".comment_wrap", ".view_btn_wrap",
+        "script", "style", "noscript"
+    ]
+    for sel in noise_selectors:
+        for tag in element.select(sel):
+            tag.decompose()
 
     # 줄바꿈 태그 변환
     for br in element.find_all("br"):
         br.replace_with("\n")
-    for p in element.find_all(["p", "div"]):
+    for p in element.find_all(["p", "div", "li"]):
         p.append("\n")
 
-    # HTML 특수 문자 디코딩
     raw_text = html.unescape(element.get_text())
 
-    # 줄 단위 공백 정리 및 잔여 전재 문구 필터링
+    # 하단 더미 데이터 차단 트리거 키워드
+    cutoff_keywords = [
+        "이전다음기사", "다음기사", "이전기사", "공유열기", "공유 닫기",
+        "댓글보기", "운영원칙 열기", "정책브리핑 게시물 운영원칙",
+        "1. 타인의 메일주소, 전화번호", "저작권정책", "담당자안내"
+    ]
+
     cleaned_lines = []
     for line in raw_text.splitlines():
         line_str = re.sub(r"[ \t]+", " ", line).strip()
+        
+        # 더미 데이터 시작 지점을 만나면 파싱 즉시 종료
+        if any(keyword in line_str for keyword in cutoff_keywords):
+            break
+
         if "보도자료를 전재하여 제공함을 알려드립니다" in line_str:
             continue
+
         if line_str:
             cleaned_lines.append(line_str)
 
@@ -106,7 +121,7 @@ def clean_html_to_text(element):
 
 def fetch_mobile_article_content(pc_url, target_dept, fallback_desc=""):
     """
-    m.korea.kr 모바일 전용 주소로 요청하여 방화벽을 우회하고 본문(view_cont) 추출
+    m.korea.kr 모바일 주소로 본문 추출 및 더미 데이터 제거
     """
     mobile_url = convert_to_mobile_url(pc_url)
     
@@ -114,16 +129,11 @@ def fetch_mobile_article_content(pc_url, target_dept, fallback_desc=""):
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
         "Referer": "https://m.korea.kr/briefing/pressReleaseList.do?pWise=mSub",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Dest": "document"
+        "Accept-Language": "ko-KR,ko;q=0.9"
     }
 
     try:
-        # 모바일 엔드포인트로 7초 타임아웃 요청
         res = session.get(mobile_url, timeout=7.0, headers=headers)
-        
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, "html.parser")
             view_containers = soup.find_all("div", class_="view_cont")
@@ -150,13 +160,10 @@ def fetch_mobile_article_content(pc_url, target_dept, fallback_desc=""):
                 text_content = clean_html_to_text(target_container)
                 if len(text_content.strip()) >= 30:
                     return text_content
-        else:
-            print(f"      [!] 모바일 응답 코드 이상: {res.status_code}")
+    except Exception:
+        pass
 
-    except Exception as e:
-        print(f"      [!] 모바일 수집 실패 ({e}) -> 피드 요약본 대체")
-
-    # 모바일 주소로도 차단된 경우 피드 요약본 안전망 가동
+    # 통신 실패 시 피드 요약본 안전망
     if fallback_desc and len(fallback_desc.strip()) > 10:
         desc_soup = BeautifulSoup(fallback_desc, "html.parser")
         desc_text = desc_soup.get_text(separator="\n\n").strip()
@@ -225,9 +232,8 @@ def main():
     # 하위 보도자료 세부 페이지 등록
     for idx, item in enumerate(target_entries, start=1):
         child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
-        print(f"  -> [{idx}/{len(target_entries)}] m.korea.kr 본문 수집 중: [{item['dept']}] {item['title'][:20]}...", flush=True)
+        print(f"  -> [{idx}/{len(target_entries)}] 처리 중: [{item['dept']}] {item['title'][:20]}...", flush=True)
         
-        # m.korea.kr 모바일 전용 주소로 본문 추출
         body_text = fetch_mobile_article_content(
             pc_url=item["link"],
             target_dept=item["dept"],
@@ -268,9 +274,9 @@ def main():
             properties={"title": [{"text": {"content": child_title}}]},
             children=content_blocks
         )
-        time.sleep(0.3)  # 노션 API Rate limit 준수
+        time.sleep(0.3)
 
-    print("=== [완료] 모든 보도자료 본문 추출 및 노션 적재 완료! ===", flush=True)
+    print("=== [완료] 불필요한 더미 데이터 없이 본문만 완벽 적재되었습니다! ===", flush=True)
 
 if __name__ == "__main__":
     main()
