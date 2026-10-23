@@ -5,13 +5,15 @@ import time
 from datetime import datetime, timedelta
 import zoneinfo
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 from notion_client import Client
 
 # -------------------------------------------------------------
-# 1. 환경 변수 및 클라이언트 설정
+# 1. 환경 변수 및 노션 클라이언트 설정
 # -------------------------------------------------------------
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 DATABASE_ID = os.environ.get("NOTION_PARENT_PAGE_ID")
@@ -19,6 +21,20 @@ FEED_URL = "https://leeroooooo.github.io/Korea_Briefing/feed.xml"
 
 notion = Client(auth=NOTION_TOKEN)
 KST = zoneinfo.ZoneInfo("Asia/Seoul")
+
+# -------------------------------------------------------------
+# 2. 방화벽 차단 회피형 HTTP 세션 구성 (Retry + Backoff)
+# -------------------------------------------------------------
+session = requests.Session()
+retries = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[500, 502, 503, 504],
+    raise_on_status=False
+)
+adapter = HTTPAdapter(max_retries=retries)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 
 def get_target_yesterday():
     """한국 시간(KST) 기준 전일자 날짜 객체 및 요일 반환"""
@@ -54,29 +70,29 @@ def extract_department_and_title(raw_title):
     return "담당부처 미상", raw_title.strip()
 
 # -------------------------------------------------------------
-# 2. 본문 텍스트 정밀 파싱 로직
+# 3. 본문 정밀 정제 및 방화벽 대응 웹 스크레이퍼
 # -------------------------------------------------------------
 def clean_html_to_text(element):
     """HTML 요소에서 전재 문구/저작권을 제거하고 줄바꿈을 완벽히 살려 순수 텍스트 반환"""
     if not element:
         return ""
 
-    # 1. 전재 안내문구(remark_briefing), 저작권(law_copy_wrap), 첨부파일, 스크립트 등 완전 제거
+    # 전재 안내문구, 저작권, 첨부파일 상자, 스크립트 등 잡음 태그 완전 제거
     for tag in element.find_all(class_=["remark_briefing", "law_copy_wrap", "filedown", "kogl", "btn"]):
         tag.decompose()
     for tag in element.find_all(["script", "style", "noscript"]):
         tag.decompose()
 
-    # 2. 줄바꿈 태그들을 실제 개행(\n)으로 변환
+    # 줄바꿈 태그들을 실제 개행(\n)으로 변환
     for br in element.find_all("br"):
         br.replace_with("\n")
     for p in element.find_all(["p", "div"]):
         p.append("\n")
 
-    # 3. HTML 엔티티(&middot;, &#x3147;, &nbsp; 등) 디코딩
+    # HTML 엔티티(&middot;, &#x3147;, &nbsp; 등) 디코딩
     raw_text = html.unescape(element.get_text())
 
-    # 4. 빈 줄 정리 및 문단 정제 (전재 문구 잔여물 2차 검증 필터)
+    # 빈 줄 정리 및 문단 정제 (전재 문구 잔여물 2차 검증 필터)
     cleaned_lines = []
     for line in raw_text.splitlines():
         line_str = re.sub(r"[ \t]+", " ", line).strip()
@@ -87,57 +103,69 @@ def clean_html_to_text(element):
 
     return "\n\n".join(cleaned_lines)
 
-def fetch_article_content(page_url, target_dept):
+def fetch_article_content(page_url, target_dept, fallback_description=""):
     """
-    모바일 헤더로 요청 후, 실제 본문 텍스트가 담긴 view_cont 영역을 정밀 타격하여 추출
+    브라우저 표준 세션으로 요청하여 view_cont 영역을 정밀 추출하되,
+    방화벽 차단(RemoteDisconnected 등) 발생 시 feed.xml의 요약문으로 안전하게 전환
     """
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1"
     }
 
     try:
-        res = requests.get(page_url, timeout=15, headers=headers)
-        if res.status_code != 200:
-            return "상세 페이지에 접속할 수 없습니다 (HTTP 에러)."
+        # 방화벽 연속 타격 방지 딜레이
+        time.sleep(0.4)
+        
+        res = session.get(page_url, timeout=12, headers=headers)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
 
-        soup = BeautifulSoup(res.text, "html.parser")
+            # 1. view_cont 컨테이너 탐색
+            view_containers = soup.find_all("div", class_="view_cont")
+            target_container = None
 
-        # 1. 모든 view_cont 태그 수집
-        view_containers = soup.find_all("div", class_="view_cont")
-        target_container = None
+            clean_dept = target_dept.strip() if target_dept else ""
+            if clean_dept and clean_dept != "담당부처 미상":
+                for vc in view_containers:
+                    data_title = vc.get("data-title", "").strip()
+                    if clean_dept in data_title or data_title in clean_dept:
+                        target_container = vc
+                        break
 
-        # 2. 1순위: data-title 속성에 부처명이 포함된 컨테이너 탐색
-        clean_dept = target_dept.strip() if target_dept else ""
-        if clean_dept and clean_dept != "담당부처 미상":
-            for vc in view_containers:
-                data_title = vc.get("data-title", "").strip()
-                if clean_dept in data_title or data_title in clean_dept:
-                    target_container = vc
-                    break
+            # 2. 매칭 실패 시 글자 수가 가장 긴 view_cont 컨테이너 자동 선택
+            if not target_container and view_containers:
+                target_container = max(view_containers, key=lambda c: len(c.get_text(strip=True)))
 
-        # 3. 2순위: 부처 매칭 실패 시, 글자 수가 가장 긴 view_cont 자동 선택 (알맹이 자동 포착)
-        if not target_container and view_containers:
-            target_container = max(view_containers, key=lambda c: len(c.get_text(strip=True)))
+            # 3. article_body 폴백
+            if not target_container:
+                target_container = soup.find("div", class_="article_body")
 
-        # 4. 3순위: article_body 폴백
-        if not target_container:
-            target_container = soup.find("div", class_="article_body")
-
-        if not target_container:
-            return "본문 영역(view_cont)을 찾을 수 없습니다. 원문 링크를 확인해 주세요."
-
-        # 순수 텍스트 정제
-        text_content = clean_html_to_text(target_container)
-
-        if len(text_content.strip()) < 30:
-            return "본문 내용이 너무 짧거나 비어 있습니다. 원문 링크를 확인해 주세요."
-
-        return text_content
+            if target_container:
+                text_content = clean_html_to_text(target_container)
+                if len(text_content.strip()) >= 30:
+                    return text_content
 
     except Exception as e:
-        return f"본문 파싱 오류 발생: {e}"
+        print(f"      [!] 웹 본문 스크레이핑 예외 ({e}) -> 피드 백업 본문으로 전환")
+
+    # 4. 방화벽 차단 또는 빈 페이지일 때 feed.xml의 description 본문 활용
+    if fallback_description and len(fallback_description.strip()) > 10:
+        desc_soup = BeautifulSoup(fallback_description, "html.parser")
+        desc_text = desc_soup.get_text(separator="\n\n").strip()
+        if len(desc_text) >= 20:
+            return f"[피드 발췌 요약본]\n\n{desc_text}"
+
+    return "상세 보도자료 본문을 불러올 수 없습니다. 상단 원문 링크를 확인해 주세요."
 
 def get_database_title_property_name(db_id):
     """노션 데이터베이스의 제목 컬럼 이름 자동 조회"""
@@ -151,7 +179,7 @@ def get_database_title_property_name(db_id):
     return "이름"
 
 # -------------------------------------------------------------
-# 3. 메인 실행 루틴
+# 4. 메인 파이프라인
 # -------------------------------------------------------------
 def main():
     yesterday, day_str = get_target_yesterday()
@@ -159,6 +187,7 @@ def main():
     
     print(f"=== [수집 시작] 기준 대상일: {yesterday_fmt} ({day_str}요일) ===")
 
+    # 갓 생성된 로컬 feed.xml 우선 로드
     feed_source = "feed.xml" if os.path.exists("feed.xml") else FEED_URL
     feed = feedparser.parse(feed_source)
     print(f"[*] 총 피드 항목 수: {len(feed.entries)}개")
@@ -172,7 +201,8 @@ def main():
             target_entries.append({
                 "dept": dept,
                 "title": clean_title,
-                "link": entry.get("link", "")
+                "link": entry.get("link", ""),
+                "description": entry.get("description", "")  # 비상용 백업 본문 보관
             })
 
     print(f"[*] 매칭된 어제자 보도자료: {len(target_entries)}개")
@@ -200,7 +230,12 @@ def main():
         child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
         print(f"  -> [{idx}/{len(target_entries)}] 본문 수집 중: [{item['dept']}] {item['title'][:20]}...")
         
-        body_text = fetch_article_content(item["link"], item["dept"])
+        # 웹 본문 추출 + 피드 백업 연동
+        body_text = fetch_article_content(
+            page_url=item["link"],
+            target_dept=item["dept"],
+            fallback_description=item.get("description", "")
+        )
 
         content_blocks = [
             {
@@ -237,7 +272,7 @@ def main():
             properties={"title": [{"text": {"content": child_title}}]},
             children=content_blocks
         )
-        time.sleep(0.35)  # API Rate limit 방지
+        time.sleep(0.35)  # 노션 API Rate limit 방지
 
     print("=== [완료] 모든 보도자료 본문 추출 및 노션 적재 성공! ===")
 
