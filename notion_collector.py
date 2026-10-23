@@ -1,6 +1,5 @@
 import os
 import re
-import io
 import time
 from datetime import datetime, timedelta
 import zoneinfo
@@ -8,7 +7,6 @@ import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
-from pypdf import PdfReader
 from notion_client import Client
 
 # 환경 변수
@@ -19,14 +17,8 @@ FEED_URL = "https://leeroooooo.github.io/Korea_Briefing/feed.xml"
 notion = Client(auth=NOTION_TOKEN)
 KST = zoneinfo.ZoneInfo("Asia/Seoul")
 
-# 불필요한 정부 웹사이트 공통 문구 필터링 키워드
-FILTER_WORDS = [
-    "공식 전자정부 누리집", "공유열기", "페이스북", "카카오톡", "저작권",
-    "공공누리", "본문듣기", "글자크기", "프린트", "게시물 운영원칙",
-    "바로보기", "내려받기", "이전기사", "다음기사", "목록"
-]
-
 def get_target_yesterday():
+    """한국 시간(KST) 기준 전일자 날짜 객체 및 요일 반환"""
     now_kst = datetime.now(KST)
     yesterday = (now_kst - timedelta(days=1)).date()
     weekdays = ["월", "화", "수", "목", "금", "토", "일"]
@@ -34,6 +26,7 @@ def get_target_yesterday():
     return yesterday, day_str
 
 def extract_entry_date(entry):
+    """RSS 항목의 날짜를 KST date 객체로 파싱"""
     date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
     if date_struct:
         dt_utc = datetime(*date_struct[:6], tzinfo=zoneinfo.ZoneInfo("UTC"))
@@ -48,90 +41,72 @@ def extract_entry_date(entry):
             return None
     return None
 
-def extract_department_and_clean_title(raw_title):
-    """
-    제목의 '[질병관리청]' 등에서 부처명을 정확히 추출하고,
-    정제된 순수 제목을 반환
-    """
+def extract_department_and_title(raw_title):
+    """제목의 [부처명]과 순수 제목 분리"""
     match = re.search(r"^\[(.*?)\]", raw_title.strip())
     if match:
         dept = match.group(1).strip()
-        # 제목 앞의 [부처명] 제거
         clean_title = re.sub(r"^\[.*?\]\s*", "", raw_title).strip()
         return dept, clean_title
     return "담당부처 미상", raw_title.strip()
 
-def extract_pdf_text_from_url(pdf_url):
-    """PDF 파일을 메모리 상에서 다운로드하여 텍스트만 추출"""
-    try:
-        res = requests.get(pdf_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        if res.status_code == 200:
-            pdf_file = io.BytesIO(res.content)
-            reader = PdfReader(pdf_file)
-            full_text = []
-            for page in reader.pages[:10]: # 최대 10페이지까지 추출
-                text = page.extract_text()
-                if text:
-                    full_text.append(text.strip())
-            return "\n\n".join(full_text)
-    except Exception as e:
-        print(f"      [!] PDF 텍스트 추출 실패: {e}")
-    return None
-
-def fetch_real_content(page_url):
+def fetch_mobile_article_content(page_url):
     """
-    상세 페이지 접속 -> 첨부된 PDF 링크 우선 탐색 후 텍스트 추출
-    PDF가 없는 경우 정제된 웹 본문 텍스트 추출
+    모바일 헤더로 페이지에 접근하여 <div class="view_cont"> 영역의 본문 텍스트 정밀 추출
     """
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    # 모바일 기기(아이폰 사파리)로 위장하여 모바일 뷰 렌더링 유도
+    mobile_headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9"
+    }
+    
     try:
-        res = requests.get(page_url, timeout=15, headers=headers)
+        res = requests.get(page_url, timeout=12, headers=mobile_headers)
         if res.status_code != 200:
             return "상세 페이지에 접속할 수 없습니다."
-        
-        soup = BeautifulSoup(res.text, "html.parser")
-        
-        # 1. 페이지 내 PDF 첨부파일 링크 탐색
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
-            if ".pdf" in href.lower():
-                # 상대 경로인 경우 절대 경로로 결합
-                if href.startswith("/"):
-                    pdf_url = f"https://www.korea.kr{href}"
-                elif href.startswith("http"):
-                    pdf_url = href
-                else:
-                    pdf_url = f"https://www.korea.kr/{href}"
-                
-                print(f"      [*] PDF 파일 발견 및 텍스트 추출 시도: {pdf_url}")
-                pdf_text = extract_pdf_text_from_url(pdf_url)
-                if pdf_text and len(pdf_text) > 100:
-                    return pdf_text
 
-        # 2. PDF가 없거나 텍스트가 안 뽑힐 경우 웹 본문 정밀 크롤링
-        # 불필요한 태그 제거
-        for tag in soup(["script", "style", "nav", "footer", "header", "form", "aside"]):
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        # 1. 대상 컨테이너(.view_cont 또는 .article_body) 정밀 타격
+        cont_div = soup.select_one(".view_cont") or soup.select_one(".article_body")
+        
+        if not cont_div:
+            return "본문 영역(.view_cont)을 찾을 수 없습니다. 원문 링크를 확인해 주세요."
+
+        # 2. 불필요한 공통 태그(저작권 안내, 재배포 문구, 스크립트 등) 사전 제거
+        for tag in cont_div.select("script, style, .remark_briefing, .copyright, noscript"):
             tag.decompose()
 
-        # 본문 후보 영역 탐색 (보통 .article-content, #articleText 등)
-        body_candidates = soup.select(".article-content, .view-con, .board-view, #articleText")
-        target_soup = body_candidates[0] if body_candidates else soup
+        # 3. <br/> 태그와 <div> 태그를 줄바꿈(\n)으로 치환
+        for br in cont_div.find_all("br"):
+            br.replace_with("\n")
 
-        valid_paragraphs = []
-        for p in target_soup.find_all(["p", "div"]):
-            txt = p.get_text(strip=True)
-            # 공통 문구 및 짧은 메뉴 제외
-            if len(txt) > 25 and not any(f in txt for f in FILTER_WORDS):
-                valid_paragraphs.append(txt)
-
-        unique_paragraphs = list(dict.fromkeys(valid_paragraphs))
-        web_text = "\n\n".join(unique_paragraphs)
-        return web_text if len(web_text) > 50 else "상세 본문 텍스트를 추출할 수 없습니다. 첨부파일 원본을 확인하세요."
+        # 4. 텍스트 추출 및 공백/불필요한 공백 행 정리
+        raw_text = cont_div.get_text()
+        lines = [line.strip() for line in raw_text.splitlines()]
         
+        # 연속된 빈 줄을 하나로 압축하고 본문 복원
+        cleaned_paragraphs = []
+        current_chunk = []
+
+        for line in lines:
+            if line:
+                current_chunk.append(line)
+            elif current_chunk:
+                cleaned_paragraphs.append(" ".join(current_chunk))
+                current_chunk = []
+        if current_chunk:
+            cleaned_paragraphs.append(" ".join(current_chunk))
+
+        final_content = "\n\n".join(cleaned_paragraphs)
+        return final_content if len(final_content) > 30 else "본문 내용이 비어 있습니다."
+
     except Exception as e:
-        return f"원문 추출 중 오류 발생: {e}"
+        return f"본문 파싱 오류 발생: {e}"
 
 def get_database_title_property_name(db_id):
+    """노션 데이터베이스의 제목 컬럼 이름 자동 조회"""
     try:
         db_info = notion.databases.retrieve(database_id=db_id)
         for prop_name, prop_data in db_info.get("properties", {}).items():
@@ -145,8 +120,9 @@ def main():
     yesterday, day_str = get_target_yesterday()
     yesterday_fmt = yesterday.strftime("%Y.%m.%d")
     
-    print(f"=== [수집 시작] 기준 대상일: {yesterday_fmt} ({day_str}요일) ===")
+    print(f"=== [수집 시작] 대상일: {yesterday_fmt} ({day_str}요일) ===")
 
+    # 피드 로드
     feed_source = "feed.xml" if os.path.exists("feed.xml") else FEED_URL
     feed = feedparser.parse(feed_source)
     print(f"[*] 총 피드 항목 수: {len(feed.entries)}개")
@@ -155,7 +131,7 @@ def main():
     for entry in feed.entries:
         if extract_entry_date(entry) == yesterday:
             raw_title = entry.get("title", "제목 없음")
-            dept, clean_title = extract_department_and_clean_title(raw_title)
+            dept, clean_title = extract_department_and_title(raw_title)
             
             target_entries.append({
                 "dept": dept,
@@ -163,17 +139,17 @@ def main():
                 "link": entry.get("link", "")
             })
 
-    print(f"[*] 필터링된 어제자 보도자료: {len(target_entries)}개")
+    print(f"[*] 매칭된 어제자 보도자료: {len(target_entries)}개")
 
     if not target_entries:
         print("[!] 대상 날짜 기사가 없어 종료합니다.")
         return
 
+    # 노션 데이터베이스 상위 페이지 생성
     clean_db_id = DATABASE_ID.replace("-", "").strip()
     title_prop_name = get_database_title_property_name(clean_db_id)
     parent_title = f"보도자료_{yesterday_fmt}.({day_str})"
 
-    # 상위 데이터베이스 행 생성
     parent_page = notion.pages.create(
         parent={"database_id": clean_db_id},
         properties={
@@ -181,16 +157,16 @@ def main():
         }
     )
     parent_page_id = parent_page["id"]
-    print(f"[+] 노션 상위 항목 생성: {parent_title}")
+    print(f"[+] 노션 상위 항목 생성 완료: {parent_title}")
 
-    # 하위 보도자료 페이지 생성
+    # 하위 보도자료 세부 페이지 등록
     for idx, item in enumerate(target_entries, start=1):
         child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
-        print(f"  -> [{idx}/{len(target_entries)}] '{item['dept']}' 본문 수집 중: {item['title'][:25]}...")
+        print(f"  -> [{idx}/{len(target_entries)}] 모바일 본문 수집: {item['dept']} - {item['title'][:20]}...")
         
-        detail_content = fetch_real_content(item["link"])
+        body_text = fetch_mobile_article_content(item["link"])
 
-        # 노션 블록 2000자 제한 대응 (문단 쪼개기)
+        # 노션 블록 구성
         content_blocks = [
             {
                 "object": "block",
@@ -198,7 +174,7 @@ def main():
                 "callout": {
                     "rich_text": [
                         {"text": {"content": f"담당부처: {item['dept']} | "}},
-                        {"text": {"content": "정책브리핑 원문 바로가기", "link": {"url": item['link']}}}
+                        {"text": {"content": "원문 링크 바로가기", "link": {"url": item['link']}}}
                     ],
                     "icon": {"emoji": "🏛️"}
                 }
@@ -206,13 +182,13 @@ def main():
             {
                 "object": "block",
                 "type": "heading_3",
-                "heading_3": {"rich_text": [{"text": {"content": "보도자료 원문 내용"}}]}
+                "heading_3": {"rich_text": [{"text": {"content": "보도자료 상세 본문"}}]}
             }
         ]
 
-        # 본문 문단을 1500자 단위로 나누어 노션 블록으로 생성
-        paragraphs = [p.strip() for p in detail_content.split("\n\n") if p.strip()]
-        for p in paragraphs[:15]: # 최대 15개 문단 등록
+        # 단락별로 노션 블록 생성 (노션 2,000자 제한 방어)
+        paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
+        for p in paragraphs[:25]:  # 주요 단락 최대 25개
             chunks = [p[i:i+1500] for i in range(0, len(p), 1500)]
             for chunk in chunks:
                 content_blocks.append({
@@ -228,7 +204,7 @@ def main():
         )
         time.sleep(0.35)
 
-    print("=== [완료] 원문 텍스트 추출 및 노션 적재 완료! ===")
+    print("=== [완료] 모바일 본문 크롤링 및 노션 적재가 완벽히 끝났습니다! ===")
 
 if __name__ == "__main__":
     main()
