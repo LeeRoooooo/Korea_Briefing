@@ -56,26 +56,22 @@ def clean_html_to_text(element):
     if not element:
         return ""
     
-    # 1. 제거할 잡음 태그 목록 (전재 문구, 공공누리, 첨부파일 박스, 스크립트 등)
+    # 불필요한 태그 사전 제거 (공공누리, 첨부파일 상자, 스크립트 등)
     for tag in element.select(".remark_briefing, .law_copy_wrap, .filedown, script, style, noscript, .btn"):
         tag.decompose()
 
-    # 2. 줄바꿈 태그들을 실제 \n 으로 변환
+    # 줄바꿈 태그 변환
     for br in element.find_all("br"):
         br.replace_with("\n")
     for p in element.find_all(["p", "div"]):
         p.append("\n")
 
-    # 3. HTML 엔티티(&middot;, &nbsp; 등) 디코딩 및 공백 정리
+    # 엔티티 변환 및 정리
     raw_text = html.unescape(element.get_text())
-    
-    # 줄 단위 정리
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in raw_text.splitlines()]
     
-    # 여러 개의 연속된 빈 줄을 하나로 통합
     cleaned_paragraphs = []
     current_block = []
-    
     for line in lines:
         if line:
             current_block.append(line)
@@ -89,10 +85,10 @@ def clean_html_to_text(element):
 
 def fetch_article_content(page_url, target_dept):
     """
-    페이지에서 target_dept(부처명)에 해당하는 <div class="view_cont"> 영역의 본문 텍스트 추출
+    모바일 헤더로 페이지에 접근하여 부처명(target_dept)에 매칭되는 view_cont 본문 텍스트 추출
     """
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ko-KR,ko;q=0.9"
     }
@@ -104,29 +100,24 @@ def fetch_article_content(page_url, target_dept):
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # 1. 우선순위 A: data-title 속성에 해당 부처명이 들어있는 view_cont 탐색
+        # 1. data-title에 부처명이 포함된 view_cont 탐색
         target_container = None
         if target_dept and target_dept != "담당부처 미상":
             target_container = soup.find("div", class_="view_cont", attrs={"data-title": re.compile(re.escape(target_dept))})
 
-        # 2. 우선순위 B: data-title 매칭이 안 되면 첫 번째 view_cont 탐색
+        # 2. 매칭되지 않으면 첫 번째 view_cont 탐색
         if not target_container:
             target_container = soup.find("div", class_="view_cont")
 
-        # 3. 우선순위 C: article_body 컨테이너 탐색
+        # 3. 없으면 article_body 탐색
         if not target_container:
             target_container = soup.find("div", class_="article_body")
 
         if not target_container:
             return "본문 영역(view_cont)을 찾을 수 없습니다. 원문 링크를 확인해 주세요."
 
-        # 텍스트 추출 및 정제
         text_content = clean_html_to_text(target_container)
-        
-        if len(text_content.strip()) < 30:
-            return "본문 내용이 너무 짧거나 비어 있습니다. 원문 링크를 확인해 주세요."
-            
-        return text_content
+        return text_content if len(text_content.strip()) >= 30 else "본문 내용이 비어 있거나 너무 짧습니다."
 
     except Exception as e:
         return f"본문 파싱 오류 발생: {e}"
@@ -189,7 +180,6 @@ def main():
         child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
         print(f"  -> [{idx}/{len(target_entries)}] 본문 수집 중: [{item['dept']}] {item['title'][:20]}...")
         
-        # 부처명(item['dept'])을 넘겨 해당 data-title 컨테이너 타격
         body_text = fetch_article_content(item["link"], item["dept"])
 
         content_blocks = [
@@ -207,13 +197,13 @@ def main():
             {
                 "object": "block",
                 "type": "heading_3",
-                "heading_3": {"rich_text": [{"text": {"content": "보도자료 본문" epidemiology if False else ""}}]}
+                "heading_3": {"rich_text": [{"text": {"content": "보도자료 본문"}}]}
             }
         ]
 
-        # 노션 블록 당 2,000자 제한 방어 (문단 단위 분할 적재)
+        # 단락별 분할 적재 (노션 2,000자 블록 제한 방어)
         paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
-        for p in paragraphs[:30]:  # 최대 30문단
+        for p in paragraphs[:30]:
             chunks = [p[i:i+1500] for i in range(0, len(p), 1500)]
             for chunk in chunks:
                 content_blocks.append({
@@ -227,7 +217,7 @@ def main():
             properties={"title": [{"text": {"content": child_title}}]},
             children=content_blocks
         )
-        time.sleep(0.35)  # API Rate limit 방지
+        time.sleep(0.35)
 
     print("=== [완료] 모든 보도자료 본문 추출 및 노션 적재 성공! ===")
 
