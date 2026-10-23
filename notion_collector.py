@@ -10,7 +10,9 @@ from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 from notion_client import Client
 
-# 환경 변수
+# -------------------------------------------------------------
+# 1. 환경 변수 및 클라이언트 설정
+# -------------------------------------------------------------
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 DATABASE_ID = os.environ.get("NOTION_PARENT_PAGE_ID")
 FEED_URL = "https://leeroooooo.github.io/Korea_Briefing/feed.xml"
@@ -51,48 +53,50 @@ def extract_department_and_title(raw_title):
         return dept, clean_title
     return "담당부처 미상", raw_title.strip()
 
+# -------------------------------------------------------------
+# 2. 본문 텍스트 정밀 파싱 로직
+# -------------------------------------------------------------
 def clean_html_to_text(element):
-    """HTML 요소에서 줄바꿈을 살리면서 순수 텍스트 추출"""
+    """HTML 요소에서 전재 문구/저작권을 제거하고 줄바꿈을 완벽히 살려 순수 텍스트 반환"""
     if not element:
         return ""
-    
-    # 불필요한 태그 사전 제거 (공공누리, 첨부파일 상자, 스크립트 등)
-    for tag in element.select(".remark_briefing, .law_copy_wrap, .filedown, script, style, noscript, .btn"):
+
+    # 1. 전재 안내문구(remark_briefing), 저작권(law_copy_wrap), 첨부파일, 스크립트 등 완전 제거
+    for tag in element.find_all(class_=["remark_briefing", "law_copy_wrap", "filedown", "kogl", "btn"]):
+        tag.decompose()
+    for tag in element.find_all(["script", "style", "noscript"]):
         tag.decompose()
 
-    # 줄바꿈 태그 변환
+    # 2. 줄바꿈 태그들을 실제 개행(\n)으로 변환
     for br in element.find_all("br"):
         br.replace_with("\n")
     for p in element.find_all(["p", "div"]):
         p.append("\n")
 
-    # 엔티티 변환 및 정리
+    # 3. HTML 엔티티(&middot;, &#x3147;, &nbsp; 등) 디코딩
     raw_text = html.unescape(element.get_text())
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in raw_text.splitlines()]
-    
-    cleaned_paragraphs = []
-    current_block = []
-    for line in lines:
-        if line:
-            current_block.append(line)
-        elif current_block:
-            cleaned_paragraphs.append("\n".join(current_block))
-            current_block = []
-    if current_block:
-        cleaned_paragraphs.append("\n".join(current_block))
 
-    return "\n\n".join(cleaned_paragraphs)
+    # 4. 빈 줄 정리 및 문단 정제 (전재 문구 잔여물 2차 검증 필터)
+    cleaned_lines = []
+    for line in raw_text.splitlines():
+        line_str = re.sub(r"[ \t]+", " ", line).strip()
+        if "보도자료를 전재하여 제공함을 알려드립니다" in line_str:
+            continue
+        if line_str:
+            cleaned_lines.append(line_str)
+
+    return "\n\n".join(cleaned_lines)
 
 def fetch_article_content(page_url, target_dept):
     """
-    모바일 헤더로 페이지에 접근하여 부처명(target_dept)에 매칭되는 view_cont 본문 텍스트 추출
+    모바일 헤더로 요청 후, 실제 본문 텍스트가 담긴 view_cont 영역을 정밀 타격하여 추출
     """
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ko-KR,ko;q=0.9"
     }
-    
+
     try:
         res = requests.get(page_url, timeout=15, headers=headers)
         if res.status_code != 200:
@@ -100,24 +104,37 @@ def fetch_article_content(page_url, target_dept):
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # 1. data-title에 부처명이 포함된 view_cont 탐색
+        # 1. 모든 view_cont 태그 수집
+        view_containers = soup.find_all("div", class_="view_cont")
         target_container = None
-        if target_dept and target_dept != "담당부처 미상":
-            target_container = soup.find("div", class_="view_cont", attrs={"data-title": re.compile(re.escape(target_dept))})
 
-        # 2. 매칭되지 않으면 첫 번째 view_cont 탐색
-        if not target_container:
-            target_container = soup.find("div", class_="view_cont")
+        # 2. 1순위: data-title 속성에 부처명이 포함된 컨테이너 탐색
+        clean_dept = target_dept.strip() if target_dept else ""
+        if clean_dept and clean_dept != "담당부처 미상":
+            for vc in view_containers:
+                data_title = vc.get("data-title", "").strip()
+                if clean_dept in data_title or data_title in clean_dept:
+                    target_container = vc
+                    break
 
-        # 3. 없으면 article_body 탐색
+        # 3. 2순위: 부처 매칭 실패 시, 글자 수가 가장 긴 view_cont 자동 선택 (알맹이 자동 포착)
+        if not target_container and view_containers:
+            target_container = max(view_containers, key=lambda c: len(c.get_text(strip=True)))
+
+        # 4. 3순위: article_body 폴백
         if not target_container:
             target_container = soup.find("div", class_="article_body")
 
         if not target_container:
             return "본문 영역(view_cont)을 찾을 수 없습니다. 원문 링크를 확인해 주세요."
 
+        # 순수 텍스트 정제
         text_content = clean_html_to_text(target_container)
-        return text_content if len(text_content.strip()) >= 30 else "본문 내용이 비어 있거나 너무 짧습니다."
+
+        if len(text_content.strip()) < 30:
+            return "본문 내용이 너무 짧거나 비어 있습니다. 원문 링크를 확인해 주세요."
+
+        return text_content
 
     except Exception as e:
         return f"본문 파싱 오류 발생: {e}"
@@ -133,6 +150,9 @@ def get_database_title_property_name(db_id):
         pass
     return "이름"
 
+# -------------------------------------------------------------
+# 3. 메인 실행 루틴
+# -------------------------------------------------------------
 def main():
     yesterday, day_str = get_target_yesterday()
     yesterday_fmt = yesterday.strftime("%Y.%m.%d")
@@ -217,7 +237,7 @@ def main():
             properties={"title": [{"text": {"content": child_title}}]},
             children=content_blocks
         )
-        time.sleep(0.35)
+        time.sleep(0.35)  # API Rate limit 방지
 
     print("=== [완료] 모든 보도자료 본문 추출 및 노션 적재 성공! ===")
 
