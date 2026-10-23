@@ -4,9 +4,7 @@ import html
 import time
 from datetime import datetime, timedelta
 import zoneinfo
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from curl_cffi import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
@@ -23,18 +21,10 @@ notion = Client(auth=NOTION_TOKEN)
 KST = zoneinfo.ZoneInfo("Asia/Seoul")
 
 # -------------------------------------------------------------
-# 2. 방화벽 차단 회피형 HTTP 세션 구성 (Retry + Backoff)
+# 2. Chrome 브라우저 위장 세션 구성 (TLS 핑거프린트 우회)
 # -------------------------------------------------------------
-session = requests.Session()
-retries = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[500, 502, 503, 504],
-    raise_on_status=False
-)
-adapter = HTTPAdapter(max_retries=retries)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
+# 실제 Chrome 124 브라우저의 TLS 핸드셰이크를 그대로 복제하여 방화벽 차단을 무력화
+session = requests.Session(impersonate="chrome124")
 
 def get_target_yesterday():
     """한국 시간(KST) 기준 전일자 날짜 객체 및 요일 반환"""
@@ -70,14 +60,14 @@ def extract_department_and_title(raw_title):
     return "담당부처 미상", raw_title.strip()
 
 # -------------------------------------------------------------
-# 3. 본문 정밀 정제 및 방화벽 대응 웹 스크레이퍼
+# 3. 본문 정밀 정제 및 방화벽 우회 수집 로직
 # -------------------------------------------------------------
 def clean_html_to_text(element):
-    """HTML 요소에서 전재 문구/저작권을 제거하고 줄바꿈을 완벽히 살려 순수 텍스트 반환"""
+    """HTML 요소에서 전재 문구/저작권을 제거하고 줄바꿈을 온전히 살려 반환"""
     if not element:
         return ""
 
-    # 전재 안내문구, 저작권, 첨부파일 상자, 스크립트 등 잡음 태그 완전 제거
+    # 불필요한 태그 완전 제거
     for tag in element.find_all(class_=["remark_briefing", "law_copy_wrap", "filedown", "kogl", "btn"]):
         tag.decompose()
     for tag in element.find_all(["script", "style", "noscript"]):
@@ -89,10 +79,10 @@ def clean_html_to_text(element):
     for p in element.find_all(["p", "div"]):
         p.append("\n")
 
-    # HTML 엔티티(&middot;, &#x3147;, &nbsp; 등) 디코딩
+    # HTML 특수 엔티티 변환
     raw_text = html.unescape(element.get_text())
 
-    # 빈 줄 정리 및 문단 정제 (전재 문구 잔여물 2차 검증 필터)
+    # 줄 단위 공백 정리 및 잔여 전재 문구 필터링
     cleaned_lines = []
     for line in raw_text.splitlines():
         line_str = re.sub(r"[ \t]+", " ", line).strip()
@@ -105,35 +95,18 @@ def clean_html_to_text(element):
 
 def fetch_article_content(page_url, target_dept, fallback_description=""):
     """
-    브라우저 표준 세션으로 요청하여 view_cont 영역을 정밀 추출하되,
-    방화벽 차단(RemoteDisconnected 등) 발생 시 feed.xml의 요약문으로 안전하게 전환
+    curl_cffi의 Chrome 위장 세션을 통해 정부 정책브리핑 원문 HTML을 파싱
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1"
-    }
-
     try:
-        # 방화벽 연속 타격 방지 딜레이
-        time.sleep(0.4)
+        time.sleep(0.5)  # 과도한 연속 호출 완화
+        res = session.get(page_url, timeout=15)
         
-        res = session.get(page_url, timeout=12, headers=headers)
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, "html.parser")
-
-            # 1. view_cont 컨테이너 탐색
             view_containers = soup.find_all("div", class_="view_cont")
             target_container = None
 
+            # 1순위: data-title 부처명 일치 확인
             clean_dept = target_dept.strip() if target_dept else ""
             if clean_dept and clean_dept != "담당부처 미상":
                 for vc in view_containers:
@@ -142,11 +115,11 @@ def fetch_article_content(page_url, target_dept, fallback_description=""):
                         target_container = vc
                         break
 
-            # 2. 매칭 실패 시 글자 수가 가장 긴 view_cont 컨테이너 자동 선택
+            # 2순위: 일치 항목이 없으면 글자 수가 가장 긴 view_cont 컨테이너 자동 선택
             if not target_container and view_containers:
                 target_container = max(view_containers, key=lambda c: len(c.get_text(strip=True)))
 
-            # 3. article_body 폴백
+            # 3순위: article_body 컨테이너 확인
             if not target_container:
                 target_container = soup.find("div", class_="article_body")
 
@@ -154,11 +127,13 @@ def fetch_article_content(page_url, target_dept, fallback_description=""):
                 text_content = clean_html_to_text(target_container)
                 if len(text_content.strip()) >= 30:
                     return text_content
+        else:
+            print(f"      [!] HTTP 응답 코드 이상: {res.status_code}")
 
     except Exception as e:
-        print(f"      [!] 웹 본문 스크레이핑 예외 ({e}) -> 피드 백업 본문으로 전환")
+        print(f"      [!] curl_cffi 수집 예외 발생: {e}")
 
-    # 4. 방화벽 차단 또는 빈 페이지일 때 feed.xml의 description 본문 활용
+    # 차단되었거나 비어 있을 경우 피드 백업 요약문 활용
     if fallback_description and len(fallback_description.strip()) > 10:
         desc_soup = BeautifulSoup(fallback_description, "html.parser")
         desc_text = desc_soup.get_text(separator="\n\n").strip()
@@ -168,7 +143,7 @@ def fetch_article_content(page_url, target_dept, fallback_description=""):
     return "상세 보도자료 본문을 불러올 수 없습니다. 상단 원문 링크를 확인해 주세요."
 
 def get_database_title_property_name(db_id):
-    """노션 데이터베이스의 제목 컬럼 이름 자동 조회"""
+    """노션 데이터베이스의 제목 속성 이름 조회"""
     try:
         db_info = notion.databases.retrieve(database_id=db_id)
         for prop_name, prop_data in db_info.get("properties", {}).items():
@@ -179,7 +154,7 @@ def get_database_title_property_name(db_id):
     return "이름"
 
 # -------------------------------------------------------------
-# 4. 메인 파이프라인
+# 4. 메인 적재 파이프라인
 # -------------------------------------------------------------
 def main():
     yesterday, day_str = get_target_yesterday()
@@ -187,7 +162,6 @@ def main():
     
     print(f"=== [수집 시작] 기준 대상일: {yesterday_fmt} ({day_str}요일) ===")
 
-    # 갓 생성된 로컬 feed.xml 우선 로드
     feed_source = "feed.xml" if os.path.exists("feed.xml") else FEED_URL
     feed = feedparser.parse(feed_source)
     print(f"[*] 총 피드 항목 수: {len(feed.entries)}개")
@@ -202,7 +176,7 @@ def main():
                 "dept": dept,
                 "title": clean_title,
                 "link": entry.get("link", ""),
-                "description": entry.get("description", "")  # 비상용 백업 본문 보관
+                "description": entry.get("description", "")
             })
 
     print(f"[*] 매칭된 어제자 보도자료: {len(target_entries)}개")
@@ -230,7 +204,6 @@ def main():
         child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
         print(f"  -> [{idx}/{len(target_entries)}] 본문 수집 중: [{item['dept']}] {item['title'][:20]}...")
         
-        # 웹 본문 추출 + 피드 백업 연동
         body_text = fetch_article_content(
             page_url=item["link"],
             target_dept=item["dept"],
@@ -256,7 +229,7 @@ def main():
             }
         ]
 
-        # 단락별 분할 적재 (노션 2,000자 블록 제한 방어)
+        # 단락별 분할 적재 (2,000자 블록 제한 방어)
         paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
         for p in paragraphs[:30]:
             chunks = [p[i:i+1500] for i in range(0, len(p), 1500)]
@@ -272,7 +245,7 @@ def main():
             properties={"title": [{"text": {"content": child_title}}]},
             children=content_blocks
         )
-        time.sleep(0.35)  # 노션 API Rate limit 방지
+        time.sleep(0.35)
 
     print("=== [완료] 모든 보도자료 본문 추출 및 노션 적재 성공! ===")
 
