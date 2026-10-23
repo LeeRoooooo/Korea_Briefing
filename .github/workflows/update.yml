@@ -63,7 +63,7 @@ jobs:
       # -------------------------------------------------------------
       - name: 노션 연동 및 텍스트 파싱 패키지 설치
         run: |
-          pip install notion-client python-dateutil feedparser requests beautifulsoup4
+          pip install notion-client python-dateutil feedparser requests beautifulsoup4 curl_cffi
 
       - name: notion_collector.py 실행 (노션 데이터베이스 적재)
         env:
