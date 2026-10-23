@@ -88,13 +88,22 @@ def clean_html_to_text(element):
 
 def fetch_content_with_mobile_browser(page, url, target_dept, fallback_desc=""):
     """
-    모바일 에뮬레이션 상태에서 페이지 접근 후 본문 추출
+    Referer 우회 및 방화벽 완화 딜레이를 적용하여 상세 본문 추출
     """
     try:
-        # commit 상태(HTML 응답 수신 직후)까지만 대기하여 타임아웃 방지
-        page.goto(url, wait_until="commit", timeout=15000)
+        # 봇 탐지 회피를 위한 사람형 탐색 간격 (2.0 ~ 2.5초 대기)
+        time.sleep(2.2)
+
+        # 목록 페이지에서 클릭해 들어온 것처럼 헤더 주입
+        page.set_extra_http_headers({
+            "Referer": "https://www.korea.kr/briefing/pressReleaseList.do",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8"
+        })
+
+        # 네트워크 수신 대기 (최대 25초)
+        response = page.goto(url, wait_until="domcontentloaded", timeout=25000)
         
-        # 모바일 DOM 렌더링을 위해 1초 대기
+        # DOM 렌더링 완료를 위해 1초 대기
         page.wait_for_timeout(1000)
 
         html_content = page.content()
@@ -123,9 +132,9 @@ def fetch_content_with_mobile_browser(page, url, target_dept, fallback_desc=""):
                 return text_content
 
     except Exception as e:
-        print(f"      [!] 모바일 브라우저 로딩 예외: {e}")
+        print(f"      [!] 브라우저 접근 예외 ({e}) -> 피드 요약본 자동 대체")
 
-    # 브라우저 차단/실패 시 feed.xml 요약본 폴백
+    # 방화벽에 막혀 ERR_EMPTY_RESPONSE가 발생해도 피드 요약본으로 무조건 적재
     if fallback_desc and len(fallback_desc.strip()) > 10:
         desc_soup = BeautifulSoup(fallback_desc, "html.parser")
         desc_text = desc_soup.get_text(separator="\n\n").strip()
@@ -191,12 +200,13 @@ def main():
     parent_page_id = parent_page["id"]
     print(f"[+] 노션 상위 항목 생성 완료: {parent_title}")
 
-    # Playwright 모바일 에뮬레이션 브라우저 기동
+    # Playwright 모바일 에뮬레이터 가동
     print("[*] Playwright 모바일 에뮬레이터(iPhone 14) 기동 중...")
     with sync_playwright() as p:
-        # iPhone 14 하드웨어/브라우저 규격 적용
         device_profile = p.devices["iPhone 14"]
         browser = p.chromium.launch(headless=True)
+        
+        # 목록 페이지를 먼저 한 번 방문하여 정상 쿠키와 세션 확보
         context = browser.new_context(
             **device_profile,
             locale="ko-KR",
@@ -204,11 +214,18 @@ def main():
         )
         page = context.new_page()
 
+        try:
+            print("[*] 방화벽 사전 인증을 위해 정책브리핑 메인 세션 로딩 중...")
+            page.goto("https://www.korea.kr/briefing/pressReleaseList.do", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(1500)
+        except Exception as e:
+            print(f"[!] 메인 페이지 세션 생성 경고 ({e}) - 수집을 계속 진행합니다.")
+
         for idx, item in enumerate(target_entries, start=1):
             child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
             print(f"  -> [{idx}/{len(target_entries)}] 모바일 본문 수집 중: [{item['dept']}] {item['title'][:20]}...")
             
-            # 모바일 페이지 본문 추출
+            # 모바일 페이지 본문 추출 (실패 시 피드 요약본 자동 적재)
             body_text = fetch_content_with_mobile_browser(
                 page=page,
                 url=item["link"],
