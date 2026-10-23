@@ -4,13 +4,13 @@ on:
   schedule:
     # 한국 시간(KST) 기준 매일 오전 06:00 (UTC 21:00)
     - cron: '0 21 * * *'
-  workflow_dispatch: # Actions 탭에서 수동 즉시 실행 지원
+  workflow_dispatch: # 필요 시 Actions 탭에서 수동 즉시 실행
 
 jobs:
   update-and-sync:
     runs-on: ubuntu-latest
-    
-    # Git 푸시 권한 강제 부여 (403 Permission Denied 방지)
+
+    # Git 푸시 권한 명시 (403 Permission Denied 방지)
     permissions:
       contents: write
 
@@ -26,18 +26,32 @@ jobs:
           python-version: '3.11'
 
       # -------------------------------------------------------------
-      # 1단계: 대한민국 정책브리핑 크롤링 -> feed.xml 생성 및 깃 푸시
+      # 1단계: Playwright 캐시 설정 및 패키지 설치 (시간 단축)
       # -------------------------------------------------------------
-      - name: RSS 스크레이퍼 패키지 설치
+      - name: Playwright 브라우저 바이너리 캐시 확인
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/main.py') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: 기본 스크레이퍼 패키지 설치
         run: |
           pip install playwright beautifulsoup4 requests
+
+      # 캐시가 일치하지 않을 때만 전체 브라우저 및 OS 의존성 다운로드 실행
+      - name: Playwright Chromium 브라우저 설치 (캐시 미적용 시에만 구동)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: |
           playwright install chromium --with-deps
 
-      - name: main.py 실행 (feed.xml 생성)
+      - name: main.py 실행 (대한민국 정책브리핑 수집 및 feed.xml 갱신)
         run: |
           python main.py
 
-      - name: feed.xml 변경사항 커밋 및 푸시
+      - name: feed.xml 변경사항 저장소에 커밋 및 푸시
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -47,11 +61,11 @@ jobs:
       # -------------------------------------------------------------
       # 2단계: 모바일 본문 파싱 -> Notion 데이터베이스 적재
       # -------------------------------------------------------------
-      - name: 노션 연동 및 파싱 패키지 설치
+      - name: 노션 연동 및 텍스트 파싱 패키지 설치
         run: |
           pip install notion-client python-dateutil feedparser requests beautifulsoup4
 
-      - name: notion_collector.py 실행 (노션 적재)
+      - name: notion_collector.py 실행 (노션 데이터베이스 적재)
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_PARENT_PAGE_ID: ${{ secrets.NOTION_PARENT_PAGE_ID }}
