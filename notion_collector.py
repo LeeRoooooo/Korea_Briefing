@@ -4,10 +4,10 @@ import html
 import time
 from datetime import datetime, timedelta
 import zoneinfo
+import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
-from playwright.sync_api import sync_playwright
 from notion_client import Client
 
 # -------------------------------------------------------------
@@ -19,6 +19,9 @@ FEED_URL = "https://leeroooooo.github.io/Korea_Briefing/feed.xml"
 
 notion = Client(auth=NOTION_TOKEN)
 KST = zoneinfo.ZoneInfo("Asia/Seoul")
+
+# 재사용 HTTP 세션
+session = requests.Session()
 
 def get_target_yesterday():
     """한국 시간(KST) 기준 전일자 날짜 객체 및 요일 반환"""
@@ -54,14 +57,28 @@ def extract_department_and_title(raw_title):
     return "담당부처 미상", raw_title.strip()
 
 # -------------------------------------------------------------
-# 2. 본문 정밀 정제 로직
+# 2. 모바일 엔드포인트 URL 변환 및 본문 정밀 정제
 # -------------------------------------------------------------
+def convert_to_mobile_url(url):
+    """
+    PC용 URL을 m.korea.kr 모바일 전용 주소 및 파라미터로 강제 변환
+    예: https://www.korea.kr/briefing/pressReleaseView.do?newsId=123
+        -> https://m.korea.kr/briefing/pressReleaseView.do?newsId=123&pWise=mSub
+    """
+    if not url:
+        return ""
+    mobile_url = url.replace("://www.korea.kr", "://m.korea.kr")
+    if "pWise=mSub" not in mobile_url:
+        separator = "&" if "?" in mobile_url else "?"
+        mobile_url = f"{mobile_url}{separator}pWise=mSub"
+    return mobile_url
+
 def clean_html_to_text(element):
-    """HTML 요소에서 불필요한 영역을 제거하고 줄바꿈을 살려 텍스트 반환"""
+    """HTML 요소에서 불필요한 영역을 제거하고 줄바꿈을 온전히 살려 반환"""
     if not element:
         return ""
 
-    # 불필요한 태그 완전 제거
+    # 불필요한 공통 태그 완전 제거
     for tag in element.find_all(class_=["remark_briefing", "law_copy_wrap", "filedown", "kogl", "btn"]):
         tag.decompose()
     for tag in element.find_all(["script", "style", "noscript"]):
@@ -73,9 +90,10 @@ def clean_html_to_text(element):
     for p in element.find_all(["p", "div"]):
         p.append("\n")
 
+    # HTML 특수 문자 디코딩
     raw_text = html.unescape(element.get_text())
 
-    # 공백 정리 및 잔여 전재 문구 필터링
+    # 줄 단위 공백 정리 및 잔여 전재 문구 필터링
     cleaned_lines = []
     for line in raw_text.splitlines():
         line_str = re.sub(r"[ \t]+", " ", line).strip()
@@ -86,59 +104,63 @@ def clean_html_to_text(element):
 
     return "\n\n".join(cleaned_lines)
 
-def fetch_content_with_mobile_browser(page, url, target_dept, fallback_desc=""):
+def fetch_mobile_article_content(pc_url, target_dept, fallback_desc=""):
     """
-    Referer 우회 및 방화벽 완화 딜레이를 적용하여 상세 본문 추출
+    m.korea.kr 모바일 전용 주소로 요청하여 방화벽을 우회하고 본문(view_cont) 추출
     """
+    mobile_url = convert_to_mobile_url(pc_url)
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+        "Referer": "https://m.korea.kr/briefing/pressReleaseList.do?pWise=mSub",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document"
+    }
+
     try:
-        # 봇 탐지 회피를 위한 사람형 탐색 간격 (2.0 ~ 2.5초 대기)
-        time.sleep(2.2)
-
-        # 목록 페이지에서 클릭해 들어온 것처럼 헤더 주입
-        page.set_extra_http_headers({
-            "Referer": "https://www.korea.kr/briefing/pressReleaseList.do",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8"
-        })
-
-        # 네트워크 수신 대기 (최대 25초)
-        response = page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        # 모바일 엔드포인트로 7초 타임아웃 요청
+        res = session.get(mobile_url, timeout=7.0, headers=headers)
         
-        # DOM 렌더링 완료를 위해 1초 대기
-        page.wait_for_timeout(1000)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            view_containers = soup.find_all("div", class_="view_cont")
+            target_container = None
 
-        html_content = page.content()
-        soup = BeautifulSoup(html_content, "html.parser")
+            # 1순위: data-title 부처명 일치 확인
+            clean_dept = target_dept.strip() if target_dept else ""
+            if clean_dept and clean_dept != "담당부처 미상":
+                for vc in view_containers:
+                    data_title = vc.get("data-title", "").strip()
+                    if clean_dept in data_title or data_title in clean_dept:
+                        target_container = vc
+                        break
 
-        view_containers = soup.find_all("div", class_="view_cont")
-        target_container = None
+            # 2순위: 일치 항목이 없으면 글자 수가 가장 긴 view_cont 컨테이너 선택
+            if not target_container and view_containers:
+                target_container = max(view_containers, key=lambda c: len(c.get_text(strip=True)))
 
-        clean_dept = target_dept.strip() if target_dept else ""
-        if clean_dept and clean_dept != "담당부처 미상":
-            for vc in view_containers:
-                data_title = vc.get("data-title", "").strip()
-                if clean_dept in data_title or data_title in clean_dept:
-                    target_container = vc
-                    break
+            # 3순위: article_body 컨테이너 확인
+            if not target_container:
+                target_container = soup.find("div", class_="article_body")
 
-        if not target_container and view_containers:
-            target_container = max(view_containers, key=lambda c: len(c.get_text(strip=True)))
-
-        if not target_container:
-            target_container = soup.find("div", class_="article_body")
-
-        if target_container:
-            text_content = clean_html_to_text(target_container)
-            if len(text_content.strip()) >= 30:
-                return text_content
+            if target_container:
+                text_content = clean_html_to_text(target_container)
+                if len(text_content.strip()) >= 30:
+                    return text_content
+        else:
+            print(f"      [!] 모바일 응답 코드 이상: {res.status_code}")
 
     except Exception as e:
-        print(f"      [!] 브라우저 접근 예외 ({e}) -> 피드 요약본 자동 대체")
+        print(f"      [!] 모바일 수집 실패 ({e}) -> 피드 요약본 대체")
 
-    # 방화벽에 막혀 ERR_EMPTY_RESPONSE가 발생해도 피드 요약본으로 무조건 적재
+    # 모바일 주소로도 차단된 경우 피드 요약본 안전망 가동
     if fallback_desc and len(fallback_desc.strip()) > 10:
         desc_soup = BeautifulSoup(fallback_desc, "html.parser")
         desc_text = desc_soup.get_text(separator="\n\n").strip()
-        if len(desc_text) >= 20:
+        if len(desc_text) >= 15:
             return f"[피드 발췌 요약본]\n\n{desc_text}"
 
     return "상세 보도자료 본문을 불러올 수 없습니다. 상단 원문 링크를 확인해 주세요."
@@ -161,11 +183,11 @@ def main():
     yesterday, day_str = get_target_yesterday()
     yesterday_fmt = yesterday.strftime("%Y.%m.%d")
     
-    print(f"=== [수집 시작] 기준 대상일: {yesterday_fmt} ({day_str}요일) ===")
+    print(f"=== [수집 시작] 기준 대상일: {yesterday_fmt} ({day_str}요일) ===", flush=True)
 
     feed_source = "feed.xml" if os.path.exists("feed.xml") else FEED_URL
     feed = feedparser.parse(feed_source)
-    print(f"[*] 총 피드 항목 수: {len(feed.entries)}개")
+    print(f"[*] 총 피드 항목 수: {len(feed.entries)}개", flush=True)
 
     target_entries = []
     for entry in feed.entries:
@@ -180,13 +202,13 @@ def main():
                 "description": entry.get("description", "")
             })
 
-    print(f"[*] 매칭된 어제자 보도자료: {len(target_entries)}개")
+    print(f"[*] 매칭된 어제자 보도자료: {len(target_entries)}개", flush=True)
 
     if not target_entries:
-        print("[!] 대상 날짜 기사가 없어 작업을 안전하게 종료합니다.")
+        print("[!] 대상 날짜 기사가 없어 작업을 안전하게 종료합니다.", flush=True)
         return
 
-    # 노션 데이터베이스 상위 페이지 생성
+    # 노션 상위 항목 생성
     clean_db_id = DATABASE_ID.replace("-", "").strip()
     title_prop_name = get_database_title_property_name(clean_db_id)
     parent_title = f"보도자료_{yesterday_fmt}.({day_str})"
@@ -198,80 +220,57 @@ def main():
         }
     )
     parent_page_id = parent_page["id"]
-    print(f"[+] 노션 상위 항목 생성 완료: {parent_title}")
+    print(f"[+] 노션 상위 항목 생성 완료: {parent_title}", flush=True)
 
-    # Playwright 모바일 에뮬레이터 가동
-    print("[*] Playwright 모바일 에뮬레이터(iPhone 14) 기동 중...")
-    with sync_playwright() as p:
-        device_profile = p.devices["iPhone 14"]
-        browser = p.chromium.launch(headless=True)
+    # 하위 보도자료 세부 페이지 등록
+    for idx, item in enumerate(target_entries, start=1):
+        child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
+        print(f"  -> [{idx}/{len(target_entries)}] m.korea.kr 본문 수집 중: [{item['dept']}] {item['title'][:20]}...", flush=True)
         
-        # 목록 페이지를 먼저 한 번 방문하여 정상 쿠키와 세션 확보
-        context = browser.new_context(
-            **device_profile,
-            locale="ko-KR",
-            timezone_id="Asia/Seoul"
+        # m.korea.kr 모바일 전용 주소로 본문 추출
+        body_text = fetch_mobile_article_content(
+            pc_url=item["link"],
+            target_dept=item["dept"],
+            fallback_desc=item.get("description", "")
         )
-        page = context.new_page()
 
-        try:
-            print("[*] 방화벽 사전 인증을 위해 정책브리핑 메인 세션 로딩 중...")
-            page.goto("https://www.korea.kr/briefing/pressReleaseList.do", wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(1500)
-        except Exception as e:
-            print(f"[!] 메인 페이지 세션 생성 경고 ({e}) - 수집을 계속 진행합니다.")
-
-        for idx, item in enumerate(target_entries, start=1):
-            child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
-            print(f"  -> [{idx}/{len(target_entries)}] 모바일 본문 수집 중: [{item['dept']}] {item['title'][:20]}...")
-            
-            # 모바일 페이지 본문 추출 (실패 시 피드 요약본 자동 적재)
-            body_text = fetch_content_with_mobile_browser(
-                page=page,
-                url=item["link"],
-                target_dept=item["dept"],
-                fallback_desc=item.get("description", "")
-            )
-
-            content_blocks = [
-                {
-                    "object": "block",
-                    "type": "callout",
-                    "callout": {
-                        "rich_text": [
-                            {"text": {"content": f"담당부처: {item['dept']} | "}},
-                            {"text": {"content": "원문 링크 바로가기", "link": {"url": item['link']}}}
-                        ],
-                        "icon": {"emoji": "🏛️"}
-                    }
-                },
-                {
-                    "object": "block",
-                    "type": "heading_3",
-                    "heading_3": {"rich_text": [{"text": {"content": "보도자료 본문"}}]}
+        content_blocks = [
+            {
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "rich_text": [
+                        {"text": {"content": f"담당부처: {item['dept']} | "}},
+                        {"text": {"content": "원문 링크 바로가기", "link": {"url": item['link']}}}
+                    ],
+                    "icon": {"emoji": "🏛️"}
                 }
-            ]
+            },
+            {
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"text": {"content": "보도자료 본문"}}]}
+            }
+        ]
 
-            paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
-            for p_chunk in paragraphs[:30]:
-                chunks = [p_chunk[i:i+1500] for i in range(0, len(p_chunk), 1500)]
-                for chunk in chunks:
-                    content_blocks.append({
-                        "object": "block",
-                        "type": "paragraph",
-                        "paragraph": {"rich_text": [{"text": {"content": chunk}}]}
-                    })
+        paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
+        for p_chunk in paragraphs[:25]:
+            chunks = [p_chunk[i:i+1500] for i in range(0, len(p_chunk), 1500)]
+            for chunk in chunks:
+                content_blocks.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"text": {"content": chunk}}]}
+                })
 
-            notion.pages.create(
-                parent={"page_id": parent_page_id},
-                properties={"title": [{"text": {"content": child_title}}]},
-                children=content_blocks
-            )
-            time.sleep(0.35)
+        notion.pages.create(
+            parent={"page_id": parent_page_id},
+            properties={"title": [{"text": {"content": child_title}}]},
+            children=content_blocks
+        )
+        time.sleep(0.3)  # 노션 API Rate limit 준수
 
-        browser.close()
-
-    print("=== [완료] 모든 보도자료 본문 추출 및 노션 적재 성공! ===")
+    print("=== [완료] 모든 보도자료 본문 추출 및 노션 적재 완료! ===", flush=True)
 
 if __name__ == "__main__":
     main()
