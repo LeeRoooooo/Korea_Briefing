@@ -4,10 +4,10 @@ import html
 import time
 from datetime import datetime, timedelta
 import zoneinfo
-from curl_cffi import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
+from playwright.sync_api import sync_playwright
 from notion_client import Client
 
 # -------------------------------------------------------------
@@ -19,12 +19,6 @@ FEED_URL = "https://leeroooooo.github.io/Korea_Briefing/feed.xml"
 
 notion = Client(auth=NOTION_TOKEN)
 KST = zoneinfo.ZoneInfo("Asia/Seoul")
-
-# -------------------------------------------------------------
-# 2. Chrome 브라우저 위장 세션 구성 (TLS 핑거프린트 우회)
-# -------------------------------------------------------------
-# 실제 Chrome 124 브라우저의 TLS 핸드셰이크를 그대로 복제하여 방화벽 차단을 무력화
-session = requests.Session(impersonate="chrome124")
 
 def get_target_yesterday():
     """한국 시간(KST) 기준 전일자 날짜 객체 및 요일 반환"""
@@ -60,29 +54,28 @@ def extract_department_and_title(raw_title):
     return "담당부처 미상", raw_title.strip()
 
 # -------------------------------------------------------------
-# 3. 본문 정밀 정제 및 방화벽 우회 수집 로직
+# 2. 본문 정밀 정제 로직
 # -------------------------------------------------------------
 def clean_html_to_text(element):
-    """HTML 요소에서 전재 문구/저작권을 제거하고 줄바꿈을 온전히 살려 반환"""
+    """HTML 요소에서 불필요한 영역을 제거하고 줄바꿈을 살려 텍스트 반환"""
     if not element:
         return ""
 
-    # 불필요한 태그 완전 제거
+    # 불필요한 요소 제거
     for tag in element.find_all(class_=["remark_briefing", "law_copy_wrap", "filedown", "kogl", "btn"]):
         tag.decompose()
     for tag in element.find_all(["script", "style", "noscript"]):
         tag.decompose()
 
-    # 줄바꿈 태그들을 실제 개행(\n)으로 변환
+    # 줄바꿈 태그 변환
     for br in element.find_all("br"):
         br.replace_with("\n")
     for p in element.find_all(["p", "div"]):
         p.append("\n")
 
-    # HTML 특수 엔티티 변환
     raw_text = html.unescape(element.get_text())
 
-    # 줄 단위 공백 정리 및 잔여 전재 문구 필터링
+    # 공백 정리
     cleaned_lines = []
     for line in raw_text.splitlines():
         line_str = re.sub(r"[ \t]+", " ", line).strip()
@@ -93,49 +86,51 @@ def clean_html_to_text(element):
 
     return "\n\n".join(cleaned_lines)
 
-def fetch_article_content(page_url, target_dept, fallback_description=""):
+def fetch_content_with_browser(page, url, target_dept, fallback_desc=""):
     """
-    curl_cffi의 Chrome 위장 세션을 통해 정부 정책브리핑 원문 HTML을 파싱
+    Playwright 브라우저 탭을 통해 원문 페이지를 열어 본문(view_cont) 추출
     """
     try:
-        time.sleep(0.5)  # 과도한 연속 호출 완화
-        res = session.get(page_url, timeout=15)
+        # domcontentloaded 상태까지만 대기하여 속도 최적화
+        page.goto(url, wait_until="domcontentloaded", timeout=20000)
         
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            view_containers = soup.find_all("div", class_="view_cont")
-            target_container = None
+        # view_cont 요소 대기 (최대 4초)
+        try:
+            page.wait_for_selector(".view_cont, .article_body", timeout=4000)
+        except Exception:
+            pass
 
-            # 1순위: data-title 부처명 일치 확인
-            clean_dept = target_dept.strip() if target_dept else ""
-            if clean_dept and clean_dept != "담당부처 미상":
-                for vc in view_containers:
-                    data_title = vc.get("data-title", "").strip()
-                    if clean_dept in data_title or data_title in clean_dept:
-                        target_container = vc
-                        break
+        html_content = page.content()
+        soup = BeautifulSoup(html_content, "html.parser")
 
-            # 2순위: 일치 항목이 없으면 글자 수가 가장 긴 view_cont 컨테이너 자동 선택
-            if not target_container and view_containers:
-                target_container = max(view_containers, key=lambda c: len(c.get_text(strip=True)))
+        view_containers = soup.find_all("div", class_="view_cont")
+        target_container = None
 
-            # 3순위: article_body 컨테이너 확인
-            if not target_container:
-                target_container = soup.find("div", class_="article_body")
+        clean_dept = target_dept.strip() if target_dept else ""
+        if clean_dept and clean_dept != "담당부처 미상":
+            for vc in view_containers:
+                data_title = vc.get("data-title", "").strip()
+                if clean_dept in data_title or data_title in clean_dept:
+                    target_container = vc
+                    break
 
-            if target_container:
-                text_content = clean_html_to_text(target_container)
-                if len(text_content.strip()) >= 30:
-                    return text_content
-        else:
-            print(f"      [!] HTTP 응답 코드 이상: {res.status_code}")
+        if not target_container and view_containers:
+            target_container = max(view_containers, key=lambda c: len(c.get_text(strip=True)))
+
+        if not target_container:
+            target_container = soup.find("div", class_="article_body")
+
+        if target_container:
+            text_content = clean_html_to_text(target_container)
+            if len(text_content.strip()) >= 30:
+                return text_content
 
     except Exception as e:
-        print(f"      [!] curl_cffi 수집 예외 발생: {e}")
+        print(f"      [!] 브라우저 본문 로딩 실패 ({e}) -> 피드 백업 전환")
 
-    # 차단되었거나 비어 있을 경우 피드 백업 요약문 활용
-    if fallback_description and len(fallback_description.strip()) > 10:
-        desc_soup = BeautifulSoup(fallback_description, "html.parser")
+    # 예외 발생 시 피드 요약본 폴백
+    if fallback_desc and len(fallback_desc.strip()) > 10:
+        desc_soup = BeautifulSoup(fallback_desc, "html.parser")
         desc_text = desc_soup.get_text(separator="\n\n").strip()
         if len(desc_text) >= 20:
             return f"[피드 발췌 요약본]\n\n{desc_text}"
@@ -143,7 +138,7 @@ def fetch_article_content(page_url, target_dept, fallback_description=""):
     return "상세 보도자료 본문을 불러올 수 없습니다. 상단 원문 링크를 확인해 주세요."
 
 def get_database_title_property_name(db_id):
-    """노션 데이터베이스의 제목 속성 이름 조회"""
+    """노션 데이터베이스의 제목 컬럼 이름 자동 조회"""
     try:
         db_info = notion.databases.retrieve(database_id=db_id)
         for prop_name, prop_data in db_info.get("properties", {}).items():
@@ -154,7 +149,7 @@ def get_database_title_property_name(db_id):
     return "이름"
 
 # -------------------------------------------------------------
-# 4. 메인 적재 파이프라인
+# 3. 메인 파이프라인
 # -------------------------------------------------------------
 def main():
     yesterday, day_str = get_target_yesterday()
@@ -199,53 +194,67 @@ def main():
     parent_page_id = parent_page["id"]
     print(f"[+] 노션 상위 항목 생성 완료: {parent_title}")
 
-    # 하위 보도자료 세부 페이지 등록
-    for idx, item in enumerate(target_entries, start=1):
-        child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
-        print(f"  -> [{idx}/{len(target_entries)}] 본문 수집 중: [{item['dept']}] {item['title'][:20]}...")
-        
-        body_text = fetch_article_content(
-            page_url=item["link"],
-            target_dept=item["dept"],
-            fallback_description=item.get("description", "")
+    # Playwright 브라우저 세션 기동
+    print("[*] Playwright 브라우저 기동 중...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale="ko-KR"
         )
+        # 이미지, 폰트, 미디어 차단으로 로딩 속도 5배 향상
+        page = context.new_page()
+        page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
 
-        content_blocks = [
-            {
-                "object": "block",
-                "type": "callout",
-                "callout": {
-                    "rich_text": [
-                        {"text": {"content": f"담당부처: {item['dept']} | "}},
-                        {"text": {"content": "원문 링크 바로가기", "link": {"url": item['link']}}}
-                    ],
-                    "icon": {"emoji": "🏛️"}
-                }
-            },
-            {
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": [{"text": {"content": "보도자료 본문"}}]}
-            }
-        ]
+        for idx, item in enumerate(target_entries, start=1):
+            child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
+            print(f"  -> [{idx}/{len(target_entries)}] 본문 수집 중: [{item['dept']}] {item['title'][:20]}...")
+            
+            # 브라우저로 실제 본문 파싱
+            body_text = fetch_content_with_browser(
+                page=page,
+                url=item["link"],
+                target_dept=item["dept"],
+                fallback_desc=item.get("description", "")
+            )
 
-        # 단락별 분할 적재 (2,000자 블록 제한 방어)
-        paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
-        for p in paragraphs[:30]:
-            chunks = [p[i:i+1500] for i in range(0, len(p), 1500)]
-            for chunk in chunks:
-                content_blocks.append({
+            content_blocks = [
+                {
                     "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": [{"text": {"content": chunk}}]}
-                })
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": [
+                            {"text": {"content": f"담당부처: {item['dept']} | "}},
+                            {"text": {"content": "원문 링크 바로가기", "link": {"url": item['link']}}}
+                        ],
+                        "icon": {"emoji": "🏛️"}
+                    }
+                },
+                {
+                    "object": "block",
+                    "type": "heading_3",
+                    "heading_3": {"rich_text": [{"text": {"content": "보도자료 본문"}}]}
+                }
+            ]
 
-        notion.pages.create(
-            parent={"page_id": parent_page_id},
-            properties={"title": [{"text": {"content": child_title}}]},
-            children=content_blocks
-        )
-        time.sleep(0.35)
+            paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
+            for p_chunk in paragraphs[:30]:
+                chunks = [p_chunk[i:i+1500] for i in range(0, len(p_chunk), 1500)]
+                for chunk in chunks:
+                    content_blocks.append({
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {"rich_text": [{"text": {"content": chunk}}]}
+                    })
+
+            notion.pages.create(
+                parent={"page_id": parent_page_id},
+                properties={"title": [{"text": {"content": child_title}}]},
+                children=content_blocks
+            )
+            time.sleep(0.35)
+
+        browser.close()
 
     print("=== [완료] 모든 보도자료 본문 추출 및 노션 적재 성공! ===")
 
