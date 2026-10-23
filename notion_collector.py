@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import time
 from datetime import datetime, timedelta
 import zoneinfo
@@ -26,7 +27,7 @@ def get_target_yesterday():
     return yesterday, day_str
 
 def extract_entry_date(entry):
-    """RSS 항목의 날짜를 KST date 객체로 파싱"""
+    """RSS 항목 날짜 파싱"""
     date_struct = entry.get("published_parsed") or entry.get("updated_parsed")
     if date_struct:
         dt_utc = datetime(*date_struct[:6], tzinfo=zoneinfo.ZoneInfo("UTC"))
@@ -50,57 +51,82 @@ def extract_department_and_title(raw_title):
         return dept, clean_title
     return "담당부처 미상", raw_title.strip()
 
-def fetch_mobile_article_content(page_url):
+def clean_html_to_text(element):
+    """HTML 요소에서 줄바꿈을 살리면서 순수 텍스트 추출"""
+    if not element:
+        return ""
+    
+    # 1. 제거할 잡음 태그 목록 (전재 문구, 공공누리, 첨부파일 박스, 스크립트 등)
+    for tag in element.select(".remark_briefing, .law_copy_wrap, .filedown, script, style, noscript, .btn"):
+        tag.decompose()
+
+    # 2. 줄바꿈 태그들을 실제 \n 으로 변환
+    for br in element.find_all("br"):
+        br.replace_with("\n")
+    for p in element.find_all(["p", "div"]):
+        p.append("\n")
+
+    # 3. HTML 엔티티(&middot;, &nbsp; 등) 디코딩 및 공백 정리
+    raw_text = html.unescape(element.get_text())
+    
+    # 줄 단위 정리
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in raw_text.splitlines()]
+    
+    # 여러 개의 연속된 빈 줄을 하나로 통합
+    cleaned_paragraphs = []
+    current_block = []
+    
+    for line in lines:
+        if line:
+            current_block.append(line)
+        elif current_block:
+            cleaned_paragraphs.append("\n".join(current_block))
+            current_block = []
+    if current_block:
+        cleaned_paragraphs.append("\n".join(current_block))
+
+    return "\n\n".join(cleaned_paragraphs)
+
+def fetch_article_content(page_url, target_dept):
     """
-    모바일 헤더로 페이지에 접근하여 <div class="view_cont"> 영역의 본문 텍스트 정밀 추출
+    페이지에서 target_dept(부처명)에 해당하는 <div class="view_cont"> 영역의 본문 텍스트 추출
     """
-    # 모바일 기기(아이폰 사파리)로 위장하여 모바일 뷰 렌더링 유도
-    mobile_headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ko-KR,ko;q=0.9"
     }
     
     try:
-        res = requests.get(page_url, timeout=12, headers=mobile_headers)
+        res = requests.get(page_url, timeout=15, headers=headers)
         if res.status_code != 200:
-            return "상세 페이지에 접속할 수 없습니다."
+            return "상세 페이지에 접속할 수 없습니다 (HTTP 에러)."
 
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # 1. 대상 컨테이너(.view_cont 또는 .article_body) 정밀 타격
-        cont_div = soup.select_one(".view_cont") or soup.select_one(".article_body")
+        # 1. 우선순위 A: data-title 속성에 해당 부처명이 들어있는 view_cont 탐색
+        target_container = None
+        if target_dept and target_dept != "담당부처 미상":
+            target_container = soup.find("div", class_="view_cont", attrs={"data-title": re.compile(re.escape(target_dept))})
+
+        # 2. 우선순위 B: data-title 매칭이 안 되면 첫 번째 view_cont 탐색
+        if not target_container:
+            target_container = soup.find("div", class_="view_cont")
+
+        # 3. 우선순위 C: article_body 컨테이너 탐색
+        if not target_container:
+            target_container = soup.find("div", class_="article_body")
+
+        if not target_container:
+            return "본문 영역(view_cont)을 찾을 수 없습니다. 원문 링크를 확인해 주세요."
+
+        # 텍스트 추출 및 정제
+        text_content = clean_html_to_text(target_container)
         
-        if not cont_div:
-            return "본문 영역(.view_cont)을 찾을 수 없습니다. 원문 링크를 확인해 주세요."
-
-        # 2. 불필요한 공통 태그(저작권 안내, 재배포 문구, 스크립트 등) 사전 제거
-        for tag in cont_div.select("script, style, .remark_briefing, .copyright, noscript"):
-            tag.decompose()
-
-        # 3. <br/> 태그와 <div> 태그를 줄바꿈(\n)으로 치환
-        for br in cont_div.find_all("br"):
-            br.replace_with("\n")
-
-        # 4. 텍스트 추출 및 공백/불필요한 공백 행 정리
-        raw_text = cont_div.get_text()
-        lines = [line.strip() for line in raw_text.splitlines()]
-        
-        # 연속된 빈 줄을 하나로 압축하고 본문 복원
-        cleaned_paragraphs = []
-        current_chunk = []
-
-        for line in lines:
-            if line:
-                current_chunk.append(line)
-            elif current_chunk:
-                cleaned_paragraphs.append(" ".join(current_chunk))
-                current_chunk = []
-        if current_chunk:
-            cleaned_paragraphs.append(" ".join(current_chunk))
-
-        final_content = "\n\n".join(cleaned_paragraphs)
-        return final_content if len(final_content) > 30 else "본문 내용이 비어 있습니다."
+        if len(text_content.strip()) < 30:
+            return "본문 내용이 너무 짧거나 비어 있습니다. 원문 링크를 확인해 주세요."
+            
+        return text_content
 
     except Exception as e:
         return f"본문 파싱 오류 발생: {e}"
@@ -120,9 +146,8 @@ def main():
     yesterday, day_str = get_target_yesterday()
     yesterday_fmt = yesterday.strftime("%Y.%m.%d")
     
-    print(f"=== [수집 시작] 대상일: {yesterday_fmt} ({day_str}요일) ===")
+    print(f"=== [수집 시작] 기준 대상일: {yesterday_fmt} ({day_str}요일) ===")
 
-    # 피드 로드
     feed_source = "feed.xml" if os.path.exists("feed.xml") else FEED_URL
     feed = feedparser.parse(feed_source)
     print(f"[*] 총 피드 항목 수: {len(feed.entries)}개")
@@ -142,7 +167,7 @@ def main():
     print(f"[*] 매칭된 어제자 보도자료: {len(target_entries)}개")
 
     if not target_entries:
-        print("[!] 대상 날짜 기사가 없어 종료합니다.")
+        print("[!] 대상 날짜 기사가 없어 작업을 안전하게 종료합니다.")
         return
 
     # 노션 데이터베이스 상위 페이지 생성
@@ -162,11 +187,11 @@ def main():
     # 하위 보도자료 세부 페이지 등록
     for idx, item in enumerate(target_entries, start=1):
         child_title = f"[{idx:02d}] [{item['dept']}] {item['title']}"
-        print(f"  -> [{idx}/{len(target_entries)}] 모바일 본문 수집: {item['dept']} - {item['title'][:20]}...")
+        print(f"  -> [{idx}/{len(target_entries)}] 본문 수집 중: [{item['dept']}] {item['title'][:20]}...")
         
-        body_text = fetch_mobile_article_content(item["link"])
+        # 부처명(item['dept'])을 넘겨 해당 data-title 컨테이너 타격
+        body_text = fetch_article_content(item["link"], item["dept"])
 
-        # 노션 블록 구성
         content_blocks = [
             {
                 "object": "block",
@@ -182,13 +207,13 @@ def main():
             {
                 "object": "block",
                 "type": "heading_3",
-                "heading_3": {"rich_text": [{"text": {"content": "보도자료 상세 본문"}}]}
+                "heading_3": {"rich_text": [{"text": {"content": "보도자료 본문" epidemiology if False else ""}}]}
             }
         ]
 
-        # 단락별로 노션 블록 생성 (노션 2,000자 제한 방어)
+        # 노션 블록 당 2,000자 제한 방어 (문단 단위 분할 적재)
         paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
-        for p in paragraphs[:25]:  # 주요 단락 최대 25개
+        for p in paragraphs[:30]:  # 최대 30문단
             chunks = [p[i:i+1500] for i in range(0, len(p), 1500)]
             for chunk in chunks:
                 content_blocks.append({
@@ -202,9 +227,9 @@ def main():
             properties={"title": [{"text": {"content": child_title}}]},
             children=content_blocks
         )
-        time.sleep(0.35)
+        time.sleep(0.35)  # API Rate limit 방지
 
-    print("=== [완료] 모바일 본문 크롤링 및 노션 적재가 완벽히 끝났습니다! ===")
+    print("=== [완료] 모든 보도자료 본문 추출 및 노션 적재 성공! ===")
 
 if __name__ == "__main__":
     main()
