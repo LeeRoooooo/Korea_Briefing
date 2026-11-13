@@ -3,7 +3,7 @@ name: Update Korea Briefing RSS & Sync to Notion
 on:
   schedule:
     # 한국 시간(KST) 매일 아침 06:00 (UTC 21:00) 정기 실행
-    - cron: '0 21 * * *'
+    - cron: '15 21 * * *'
   workflow_dispatch: # Actions 탭에서 수동 즉시 실행 지원
 
 permissions:
